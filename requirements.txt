@@ -1,4 +1,5 @@
 datasets==2.20.0
+bitsandbytes==0.43.1
 ivon-opt==0.1.3
 numpy==1.26.4
 peft==0.11.1
