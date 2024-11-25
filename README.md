@@ -5,6 +5,8 @@ This repository contains the code for the experiments presented in the following
 __Variational Low-Rank Adaptation Using IVON__  
 _B. Cong, N. Daheim, Y. Shen, D. Cremers, R. Yokota, M.E. Khan, T. Möllenhoff_
 
+This codebase depends on an implementation of the IVON optimizer which is released in a separate repo (https://github.com/team-approx-bayes/ivon) and as a pip installable package `ivon-opt`.
+
 ## Dependencies
 
 Use the following command to install the necessary dependencies using pip:
