@@ -14,6 +14,41 @@ from data import get_processed_datasets, get_raw_datasets
 from model import WrappedModel, get_model_with_lora
 from utils import calculate_metrics, initialize
 
+if torch.cuda.is_available():
+    device = 'cuda'
+else:
+    device = 'cpu'
+
+
+def compute_uncertainties(probs: torch.Tensor, eps: float = 1e-12):
+    """
+    Compute Total, Aleatoric, and Epistemic uncertainty from Monte Carlo logits.
+
+    Args:
+        probs (torch.Tensor): Probs of shape (T, B, C), where
+            T = number of MC samples,
+            B = batch size,
+            C = number of classes.
+        eps (float): Small constant for numerical stability in log/entropy.
+
+    Returns:
+        total_unc (torch.Tensor): Total uncertainty (entropy of mean predictive), shape (B,).
+        ale_unc   (torch.Tensor): Aleatoric uncertainty (mean entropy of each predictive), shape (B,).
+        epi_unc   (torch.Tensor): Epistemic uncertainty (total_unc - ale_unc), shape (B,).
+    """
+    # 1. Mean predictive distribution across MC samples
+    probs_mean = probs.mean(dim=0)  # (B, C)
+
+    # 2. Total uncertainty: entropy of the mean predictive
+    total_unc = -torch.sum(probs_mean * torch.log(probs_mean), dim=1)  # (B,)
+
+    # 3. Aleatoric uncertainty: mean entropy of each predictive distribution
+    ale_unc = torch.mean(-torch.sum(probs * torch.log(probs), dim=2), dim=0)  # (B,)
+
+    # 4. Epistemic uncertainty: difference between total and aleatoric
+    epi_unc = total_unc - ale_unc  # (B,)
+
+    return total_unc, ale_unc, epi_unc
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -71,6 +106,7 @@ def main():
         args.model_name_or_path, args.lora_r, args.lora_alpha, args.lora_dropout
     )
     model = WrappedModel(model, args.task_name, tokenizer)
+    model.to(device)
 
     raw_datasets = get_raw_datasets(args.task_name)
     processed_datasets = get_processed_datasets(
@@ -113,6 +149,7 @@ def main():
     completed_steps = 0
     for _ in range(math.ceil(args.max_train_steps / len(train_dataloader))):
         for step, train_batch in enumerate(train_dataloader):
+            train_batch = {k: v.to(device) for k, v in train_batch.items()}
             if completed_steps % args.eval_interval == 0:
                 model.eval()
                 if args.save_to is not None:
@@ -123,6 +160,7 @@ def main():
                 labels_list = []
                 with torch.inference_mode():
                     for batch in tqdm(eval_dataloader, disable=not args.tqdm):
+                        batch = {k: v.to(device) for k, v in batch.items()}
                         logits_list.append(model(**batch))
                         labels_list.append(batch["labels"])
                         if args.optimizer == "ivon":
@@ -130,6 +168,8 @@ def main():
                             for _ in range(args.test_num_samples):
                                 with optimizer.sampled_params(train=False):
                                     batch_logits_samples.append(model(**batch))
+                            # len(batch_logits_samples) == args.test_num_samples (10)
+                            # each batch_logits_samples[i] is logits for one sample: shape (batch_size, num_classes) for winogrande_s (4,2)
                             logits_list_samples.append(batch_logits_samples)
 
                 logits = torch.cat(logits_list, dim=0)
@@ -148,14 +188,16 @@ def main():
 
                 if args.optimizer == "ivon":
                     probs_sum = torch.zeros_like(logits)
+                    all_probs = []
                     for idx in range(args.test_num_samples):
-                        probs_sum += torch.softmax(
-                            torch.cat([batch[idx] for batch in logits_list_samples], dim=0), dim=-1
-                        )
+                        logits_sample = torch.cat([batch[idx] for batch in logits_list_samples], dim=0)
+                        probs = torch.softmax(logits_sample, dim=-1)
+                        probs_sum += probs
                         probs = probs_sum / (idx + 1)
+                        all_probs.append(probs)
                         acc, nll, ece, brier = calculate_metrics(probs, labels)
 
-                        print(
+                        print(  
                             f"Val @{idx + 1} samples: Step {completed_steps} "
                             f"Accuracy: {acc:.4f} NLL: {nll:.4f} ECE: {ece:.4f} Brier: {brier:.4f}"
                         )
@@ -163,8 +205,13 @@ def main():
                             json_results.append(
                                 {"num_samples": idx + 1, "accuracy": acc, "nll": nll, "ece": ece, "brier": brier}
                             )
+                    print(f'probs_sum: {probs_sum.shape})')
                     logits_list_samples = []
-
+                    # Compute uncertainties
+                    total_unc, ale_unc, epi_unc = compute_uncertainties(torch.stack(all_probs, dim=0))
+                    print(  
+                            f"TU: {total_unc.mean():.4f} AU: {ale_unc.mean():.4f} EU: {epi_unc.mean():.4f}"
+                    )
                 if args.save_to is not None:
                     with open(eval_results_path, 'w', newline='', encoding='utf-8') as f:
                         json.dump(json_results, f)
